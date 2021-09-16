@@ -41,7 +41,7 @@ class MultipleNegativesRankingLoss(nn.Module):
         """
         :param model: SentenceTransformer model
         :param scale: Output of similarity function is multiplied by scale value
-        :param similarity_fct: similarity function between sentence embeddings. By default, cos_sim. Can also be set to dot product (and then set scale to 1)
+        :param similarity_fct: similarity function between sentence embeddings. By default, cos_sim. Can also be set to dot product (and then set sclae to 1)
         """
         super(MultipleNegativesRankingLoss, self).__init__()
         self.model = model
@@ -58,9 +58,6 @@ class MultipleNegativesRankingLoss(nn.Module):
         scores = self.similarity_fct(embeddings_a, embeddings_b) * self.scale
         labels = torch.tensor(range(len(scores)), dtype=torch.long, device=scores.device)  # Example a[i] should match with b[i]
         return self.cross_entropy_loss(scores, labels)
-
-    def get_config_dict(self):
-        return {'scale': self.scale, 'similarity_fct': self.similarity_fct.__name__}
 
 
 

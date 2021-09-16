@@ -1,6 +1,8 @@
 
+from torch import tensor
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
 import numpy as np
+import shutil
 import logging
 import os
 from typing import Dict, Type, Callable, List
@@ -13,13 +15,12 @@ from tqdm.autonotebook import tqdm, trange
 from .. import SentenceTransformer, util
 from ..evaluation import SentenceEvaluator
 
-
 logger = logging.getLogger(__name__)
 
 
 class CrossEncoder():
     def __init__(self, model_name:str, num_labels:int = None, max_length:int = None, device:str = None, tokenizer_args:Dict = {},
-                 default_activation_function = None):
+                 default_activation_function = None, gradient_checkpointing:bool = False):
         """
         A CrossEncoder takes exactly two sentences / texts as input and either predicts
         a score or label for this sentence pair. It can for example predict the similarity of the sentence pair
@@ -39,7 +40,8 @@ class CrossEncoder():
         classifier_trained = True
         if self.config.architectures is not None:
             classifier_trained = any([arch.endswith('ForSequenceClassification') for arch in self.config.architectures])
-
+        if gradient_checkpointing == True:
+            self.config.gradient_checkpointing=True
         if num_labels is None and not classifier_trained:
             num_labels = 1
 
@@ -74,15 +76,16 @@ class CrossEncoder():
         for example in batch:
             for idx, text in enumerate(example.texts):
                 texts[idx].append(text.strip())
-
             labels.append(example.label)
 
         tokenized = self.tokenizer(*texts, padding=True, truncation='longest_first', return_tensors="pt", max_length=self.max_length)
+        if self.config.gradient_checkpointing:
+            tokenized['global_attention_mask'] = torch.zeros_like(tokenized['attention_mask'])
+            tokenized['global_attention_mask'][:,0]=1
         labels = torch.tensor(labels, dtype=torch.float if self.config.num_labels == 1 else torch.long).to(self._target_device)
-
         for name in tokenized:
             tokenized[name] = tokenized[name].to(self._target_device)
-
+        logger.info("tokenized: {}".format(tokenized))
         return tokenized, labels
 
     def smart_batching_collate_text_only(self, batch):
@@ -94,8 +97,13 @@ class CrossEncoder():
 
         tokenized = self.tokenizer(*texts, padding=True, truncation='longest_first', return_tensors="pt", max_length=self.max_length)
 
+        if self.config.gradient_checkpointing:
+            tokenized['global_attention_mask'] = torch.zeros_like(tokenized['attention_mask'])
+            tokenized['global_attention_mask'][:,0]=1
+
         for name in tokenized:
             tokenized[name] = tokenized[name].to(self._target_device)
+        logger.info("tokenized: {}".format(tokenized))
 
         return tokenized
 
@@ -116,7 +124,11 @@ class CrossEncoder():
             max_grad_norm: float = 1,
             use_amp: bool = False,
             callback: Callable[[float, int, int], None] = None,
-            show_progress_bar: bool = True
+            checkpoint_path: str = None,
+            checkpoint_save_steps: int = 500,
+            checkpoint_save_total_limit: int = 1,
+            accumulation_steps: int = 4,
+            skip_scheduler: bool = False
             ):
         """
         Train the model with the given training objective
@@ -142,7 +154,6 @@ class CrossEncoder():
         :param callback: Callback function that is invoked after each evaluation.
                 It must accept the following three parameters in this order:
                 `score`, `epoch`, `steps`
-        :param show_progress_bar: If True, output a tqdm progress bar
         """
         train_dataloader.collate_fn = self.smart_batching_collate
 
@@ -168,21 +179,21 @@ class CrossEncoder():
         ]
 
         optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
-
+        logger.info("warmup_steps/acc: {}".format(str(warmup_steps//accumulation_steps)))
         if isinstance(scheduler, str):
-            scheduler = SentenceTransformer._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=num_train_steps)
+            scheduler = SentenceTransformer._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps//accumulation_steps, t_total=num_train_steps//accumulation_steps)
 
         if loss_fct is None:
             loss_fct = nn.BCEWithLogitsLoss() if self.config.num_labels == 1 else nn.CrossEntropyLoss()
 
+        global_step=0
 
-        skip_scheduler = False
-        for epoch in trange(epochs, desc="Epoch", disable=not show_progress_bar):
+        for epoch in trange(epochs, desc="Epoch"):
             training_steps = 0
             self.model.zero_grad()
             self.model.train()
-
-            for features, labels in tqdm(train_dataloader, desc="Iteration", smoothing=0.05, disable=not show_progress_bar):
+            for features, labels in tqdm(train_dataloader, desc="Iteration", smoothing=0.05):
+                logger.info("label: {}".format(str(labels)) )
                 if use_amp:
                     with autocast():
                         model_predictions = self.model(**features, return_dict=True)
@@ -190,7 +201,6 @@ class CrossEncoder():
                         if self.config.num_labels == 1:
                             logits = logits.view(-1)
                         loss_value = loss_fct(logits, labels)
-
                     scale_before_step = scaler.get_scale()
                     scaler.scale(loss_value).backward()
                     scaler.unscale_(optimizer)
@@ -205,16 +215,23 @@ class CrossEncoder():
                     if self.config.num_labels == 1:
                         logits = logits.view(-1)
                     loss_value = loss_fct(logits, labels)
+                    logger.info("logits: {}".format(str(logits)) )
+                    logger.info("loss_value: {}".format(str(loss_value)) )
+                    loss_value = loss_value / accumulation_steps
                     loss_value.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-                    optimizer.step()
+                    if (training_steps+1) % accumulation_steps == 0 or (training_steps+1 == len(train_dataloader)):
+                        optimizer.step()
 
-                optimizer.zero_grad()
+                if (training_steps+1) % accumulation_steps == 0 or (training_steps+1 == len(train_dataloader)):
+                    optimizer.zero_grad()
 
                 if not skip_scheduler:
-                    scheduler.step()
+                    if (training_steps+1) % accumulation_steps == 0 or (training_steps+1 == len(train_dataloader)):
+                        scheduler.step()
 
                 training_steps += 1
+                global_step += 1
 
                 if evaluator is not None and evaluation_steps > 0 and training_steps % evaluation_steps == 0:
                     self._eval_during_training(evaluator, output_path, save_best_model, epoch, training_steps, callback)
@@ -222,10 +239,17 @@ class CrossEncoder():
                     self.model.zero_grad()
                     self.model.train()
 
+                if checkpoint_path is not None and checkpoint_save_steps is not None and checkpoint_save_steps > 0 and global_step % checkpoint_save_steps == 0:
+                    self._save_checkpoint(checkpoint_path, checkpoint_save_total_limit, global_step)
+
             if evaluator is not None:
                 self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1, callback)
 
+        if evaluator is None and output_path is not None:   #No evaluator, but output path: save final model version
+            self.save(output_path)
 
+        if checkpoint_path is not None:
+            self._save_checkpoint(checkpoint_path, checkpoint_save_total_limit, global_step)
 
     def predict(self, sentences: List[List[str]],
                batch_size: int = 32,
@@ -273,7 +297,8 @@ class CrossEncoder():
             for features in iterator:
                 model_predictions = self.model(**features, return_dict=True)
                 logits = activation_fct(model_predictions.logits)
-
+                logger.warning("logits: {}".format(str(model_predictions.logits)) )
+                #logger.warning("features: {}".format(str(features['input_ids'].cpu().detach().numpy())))
                 if apply_softmax and len(logits[0]) > 1:
                     logits = torch.nn.functional.softmax(logits, dim=1)
                 pred_scores.extend(logits)
@@ -302,6 +327,21 @@ class CrossEncoder():
                 self.best_score = score
                 if save_best_model:
                     self.save(output_path)
+
+    def _save_checkpoint(self, checkpoint_path, checkpoint_save_total_limit, step):
+        # Store new checkpoint
+        self.save(os.path.join(checkpoint_path, str(step)))
+
+        # Delete old checkpoints
+        if checkpoint_save_total_limit is not None and checkpoint_save_total_limit > 0:
+            old_checkpoints = []
+            for subdir in os.listdir(checkpoint_path):
+                if subdir.isdigit():
+                    old_checkpoints.append({'step': int(subdir), 'path': os.path.join(checkpoint_path, subdir)})
+
+            if len(old_checkpoints) > checkpoint_save_total_limit:
+                old_checkpoints = sorted(old_checkpoints, key=lambda x: x['step'])
+                shutil.rmtree(old_checkpoints[0]['path'])
 
     def save(self, path):
         """
